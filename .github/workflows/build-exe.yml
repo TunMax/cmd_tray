@@ -37,7 +37,8 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up uv and Python
-        uses: astral-sh/setup-uv@v10
+        # v8+ 没有浮动大版本标签（不存在 v8/v9/v10），需固定到具体版本
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: '3.12'
           enable-cache: true
