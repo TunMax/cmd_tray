@@ -1,28 +1,64 @@
 # -*- coding: utf-8 -*-
+import os
+import subprocess
 import sys
+import time
+
+import pywintypes
 import wx
 import wx.adv
-import multiprocessing, os, time, yaml
-import win32gui, win32con
-import subprocess
+import win32con
+import win32console
+import win32gui
+import yaml
 
 
-def cmd_run_lite(cmd):
-    subprocess.run(cmd, shell=True)
+def start_app(cmd):
+    """在新控制台中启动命令，返回子进程对象。"""
+    return subprocess.Popen(
+        cmd,
+        shell=True,
+        creationflags=subprocess.CREATE_NEW_CONSOLE,
+    )
 
 
-def start_app(CMD):
-    cmd_run_lite('start ' + CMD)
+def find_console_hwnd(proc, timeout=8.0, interval=0.1):
+    """获取子进程所使用控制台的窗口句柄。
+
+    AttachConsole 把当前进程临时附加到子进程的控制台，再用
+    GetConsoleWindow 取得该控制台窗口的 HWND。整个过程不依赖
+    exe 名称、窗口标题或配置文件中的 FileName。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return 0
+        try:
+            # AttachConsole 要求当前进程未附加到其他控制台
+            win32console.FreeConsole()
+            win32console.AttachConsole(proc.pid)
+            try:
+                hwnd = win32console.GetConsoleWindow()
+            finally:
+                win32console.FreeConsole()
+            if hwnd:
+                return int(hwnd)
+        except pywintypes.error:
+            pass
+        time.sleep(interval)
+    return 0
 
 
 class FolderBookmarkTaskBarIcon(wx.adv.TaskBarIcon):
     MENU_ID1, MENU_ID2, MENU_ID3 = wx.NewIdRef(count=3)
 
-    def __init__(self, ICON, TITLE):
+    def __init__(self, ICON, TITLE, hwnd, proc):
         super().__init__()
         # 传参
         self.ICON = ICON
         self.TITLE = TITLE
+        self.hwnd = hwnd
+        self.proc = proc
         # 设置图标和提示
         self.SetIcon(wx.Icon(self.ICON), self.TITLE)
         # 绑定菜单项事件
@@ -39,52 +75,95 @@ class FolderBookmarkTaskBarIcon(wx.adv.TaskBarIcon):
         menu.Append(self.MENU_ID3, '退出')
         return menu
 
+    def _get_hwnd(self):
+        """返回有效的控制台窗口句柄，句柄失效时尝试重新绑定。"""
+        if self.hwnd and win32gui.IsWindow(self.hwnd):
+            return self.hwnd
+        self.hwnd = 0
+        if self.proc is not None and self.proc.poll() is None:
+            self.hwnd = find_console_hwnd(self.proc, timeout=1.0)
+        return self.hwnd
+
     def onOne(self, event):
         pass
 
     def onTwo(self, event):
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            wx.MessageBox('未找到控制台窗口，程序可能已经退出。', '提示',
+                          wx.OK | wx.ICON_INFORMATION)
+            return
         if win32gui.IsWindowVisible(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
         else:
             win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except pywintypes.error:
+                pass
 
     def onExit(self, event):
-        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        hwnd = self._get_hwnd()
+        if hwnd:
+            try:
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            except pywintypes.error:
+                pass
+        elif self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
         wx.Exit()
 
 
 class MyFrame(wx.Frame):
-    def __init__(self, ICON, TITLE):
+    def __init__(self, ICON, TITLE, hwnd, proc):
         super().__init__()
-        FolderBookmarkTaskBarIcon(ICON, TITLE)
+        # 保存引用，避免托盘图标对象被回收
+        self.tray_icon = FolderBookmarkTaskBarIcon(ICON, TITLE, hwnd, proc)
 
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()  # 解决pyinstaller打包后多进程模块无法工作
     app = wx.App()
-    # 读取yaml配置
-    server_name = []
-    with open('cmd_tray.yaml', 'r', encoding='utf8') as f:
-        config = yaml.load(f.read(), Loader=yaml.FullLoader)
-    # 启动相关exe
-    multiprocessing.Process(target=start_app, args=(config['CMD'],)).start()
-    # 找到cmd窗口并隐藏
-    time_count = time.time()
-    while True:
-        hwnd = win32gui.FindWindow(None, os.getcwd().replace('/', '\\') + '\\' + config['FileName'])
-        print('finding cmd window...')
-        if hwnd != 0:
-            win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
-            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
-            break
-        if time.time() - time_count > 8:
-            wx.MessageBox('程序未能正常找到控制台窗口，即将关闭！', '注意', wx.OK | wx.ICON_WARNING)
-            sys.exit()
+
+    # 配置文件和程序放在同一目录，不依赖当前工作目录
+    base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    config_path = os.path.join(base_dir, 'cmd_tray.yaml')
+    with open(config_path, 'r', encoding='utf8') as f:
+        config = yaml.safe_load(f) or {}
+
+    cmd = str(config.get('CMD') or '').strip()
+    if not cmd:
+        wx.MessageBox('请在 cmd_tray.yaml 中填写要运行的 CMD。', '配置错误',
+                      wx.OK | wx.ICON_ERROR)
+        sys.exit(1)
+
+    # 在新控制台中启动程序，然后绑定该控制台窗口
+    try:
+        proc = start_app(cmd)
+    except OSError as exc:
+        wx.MessageBox('启动命令失败：%s' % exc, '错误', wx.OK | wx.ICON_ERROR)
+        sys.exit(1)
+
+    hwnd = find_console_hwnd(proc)
+    if not hwnd:
+        wx.MessageBox('程序未能获取控制台窗口，即将关闭！', '注意',
+                      wx.OK | wx.ICON_WARNING)
+        if proc.poll() is None:
+            proc.terminate()
+        sys.exit()
+
+    # 隐藏控制台窗口
+    win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+
     # 图标相对路径处理
-    if os.path.exists(os.path.join(os.getcwd(), config['Logo'])) == True:
-        config['Logo'] = os.path.join(os.getcwd(), config['Logo'])
+    logo = str(config.get('Logo') or '')
+    if logo and not os.path.isabs(logo):
+        logo_path = os.path.join(base_dir, logo)
+        if os.path.exists(logo_path):
+            logo = logo_path
+    title = str(config.get('AppName') or 'CMD Tray')
+
     # Then a frame.
-    frm = MyFrame(config['Logo'], config['AppName'])
+    frm = MyFrame(logo, title, hwnd, proc)
     # Show it.
     frm.Show()
     app.MainLoop()

@@ -1,0 +1,145 @@
+name: Build and Release Windows EXE
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - 'cmd_tray.py'
+      - 'pyproject.toml'
+      - 'cmd_tray.yaml'
+      - 'favicon.ico'
+      - '.github/workflows/build-exe.yml'
+  pull_request:
+    paths:
+      - 'cmd_tray.py'
+      - 'pyproject.toml'
+      - 'cmd_tray.yaml'
+      - 'favicon.ico'
+      - '.github/workflows/build-exe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64 executable
+    runs-on: windows-latest
+    timeout-minutes: 20
+    concurrency:
+      group: build-windows-exe-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: '3.12'
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Build EXE with PyInstaller
+        run: >
+          uv run --with "pyinstaller>=6,<7" pyinstaller
+          --noconfirm
+          --clean
+          --onefile
+          --noconsole
+          --name cmd_tray
+          --icon favicon.ico
+          --hidden-import win32console
+          cmd_tray.py
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item 'dist\cmd_tray.exe' 'package\cmd_tray.exe'
+          Copy-Item 'cmd_tray.yaml' 'package\cmd_tray.yaml'
+          Copy-Item 'favicon.ico' 'package\favicon.ico'
+          Copy-Item 'README.md' 'package\README.md'
+          Copy-Item 'LICENSE' 'package\LICENSE'
+          Get-ChildItem package | Format-Table Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cmd_tray-windows-x64
+          path: package
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: cmd-tray-release
+      cancel-in-progress: false
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: cmd_tray-windows-x64
+          path: release
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # 版本号使用中国标准时间（UTC+8）的日期
+          base_version="$(TZ=Asia/Shanghai date +%Y%m%d)"
+          version="$base_version"
+          post=0
+
+          # 标签或 Release 已存在时，依次尝试 .post1、.post2 ...
+          while gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${version}" >/dev/null 2>&1 \
+                || gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${version}" >/dev/null 2>&1; do
+            post=$((post + 1))
+            version="${base_version}.post${post}"
+          done
+
+          echo "Release version: ${version}"
+
+          # 构建产物可能直接解压到 release/，也可能位于子目录中
+          exe_path="$(find release -type f -name cmd_tray.exe -print -quit)"
+          if [ -z "$exe_path" ]; then
+            echo "Built cmd_tray.exe not found." >&2
+            exit 1
+          fi
+          package_dir="$(dirname "$exe_path")"
+
+          asset_name="cmd_tray-${version}-windows-x64.zip"
+          zip -j "$asset_name" \
+            "$package_dir/cmd_tray.exe" \
+            "$package_dir/cmd_tray.yaml" \
+            "$package_dir/favicon.ico" \
+            "$package_dir/README.md" \
+            "$package_dir/LICENSE"
+
+          gh release create "$version" "$asset_name" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$version" \
+            --notes "Automated Windows x64 build from commit ${GITHUB_SHA}." \
+            --latest
