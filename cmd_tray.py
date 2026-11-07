@@ -65,6 +65,9 @@ class FolderBookmarkTaskBarIcon(wx.adv.TaskBarIcon):
         self.Bind(wx.EVT_MENU, self.onOne, id=self.MENU_ID1)
         self.Bind(wx.EVT_MENU, self.onTwo, id=self.MENU_ID2)
         self.Bind(wx.EVT_MENU, self.onExit, id=self.MENU_ID3)
+        # 左键单击托盘图标：显示/隐藏控制台
+        # 使用 LEFT_DOWN 而非 LEFT_UP，避免双击时触发两次切换
+        self.Bind(wx.adv.EVT_TASKBAR_LEFT_DOWN, self.onLeftClick)
 
     def CreatePopupMenu(self):
         '''生成菜单'''
@@ -87,7 +90,15 @@ class FolderBookmarkTaskBarIcon(wx.adv.TaskBarIcon):
     def onOne(self, event):
         pass
 
+    def onLeftClick(self, event):
+        """左键单击托盘图标，效果与“显示/隐藏控制台”菜单项相同。"""
+        self.toggle_console()
+
     def onTwo(self, event):
+        self.toggle_console()
+
+    def toggle_console(self):
+        """显示或隐藏控制台窗口。"""
         hwnd = self._get_hwnd()
         if not hwnd:
             wx.MessageBox('未找到控制台窗口，程序可能已经退出。', '提示',
